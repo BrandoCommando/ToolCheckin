@@ -4,19 +4,21 @@
 #include <driver/touch_pad.h>
 
 #define RST_PIN         17
-#define IRQ_PIN         16
+// #define IRQ_PIN         16
 #define SPI_MOSI_PIN    23
 #define SPI_MISO_PIN    19
 #define SPI_SCK_PIN     18
 #define SPI_SS1_PIN     5
-#define SPI_SS2_PIN     22
+#define RED_PIN 26
+#define YELLOW_PIN 27
+#define GREEN_PIN 14
+// #define SPI_SS2_PIN     22
 // #define SPI_SS3_PIN     7
 // #define SPI_SS4_PIN     8
 // #define SPI_SS5_PIN     10
 // #define SPI_SS6_PIN     11
 // #define SPI_SS7_PIN     12
 // #define SPI_SS8_PIN     13
-#define NUM_TOOLS 8
 #define SLEEP_DELAY 30000
 #define AT_WORK
 #define RASPAP
@@ -91,11 +93,14 @@ MFRC522 rfid7(SPI_SS7_PIN, RST_PIN);
 MFRC522 rfid8(SPI_SS8_PIN, RST_PIN);
 #endif
 
+RTC_DATA_ATTR String lastUID = "";
+bool bLastRead1 = false;
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR String checkinTag = "";
 RTC_DATA_ATTR volatile bool bNewTouch = false;
 volatile bool bNewInt = false;
 byte regVal = 0x7F;
+long lastRead = 0;
 
 void activateRec(MFRC522 rfid);
 void clearInt(MFRC522 rfid);
@@ -158,6 +163,18 @@ void setup() {
   Serial.begin(9600);
   while(!Serial);
 
+  #ifdef RED_PIN
+  pinMode(RED_PIN, OUTPUT);
+  digitalWrite(RED_PIN, 1);
+  #endif
+  #ifdef YELLOW_PIN
+  pinMode(YELLOW_PIN, OUTPUT);
+  digitalWrite(YELLOW_PIN, 0);
+  #endif
+  pinMode(GREEN_PIN, OUTPUT);
+  digitalWrite(GREEN_PIN, 0);
+
+
   Serial.println();
 
   // setup_rfid();
@@ -166,7 +183,6 @@ void setup() {
   {
     connect_wifi();
     send_checkin();
-    disconnect_wifi();
   }
   
  
@@ -189,29 +205,39 @@ void setup() {
 
   bNewTouch = false;
   for(uint8_t t = T0; t <= T9; t++)
-    touchAttachInterrupt(t, tp_callback, 40);
+    if(t != T7 && t != T6 && t != T5)
+     touchAttachInterrupt(t, tp_callback, 40);
 
   Serial.println("Waiting for RFID...");
 
-  setup_rfids();  
+  setup_rfids();
 
   unsigned long start = millis();
   do {
+    if(lastRead == 0 || millis() - lastRead > 500) {
     check_rfid();
     activateRec(rfid1);
+    }
     #ifdef SPI_SS2_PIN
     activateRec(rfid2);
     #endif
-    delay(100);
+    delay(250);
     if(bNewTouch)
     {
       start = millis();
+      send_checkin();
       bNewTouch = false;
+      Serial.println(F("You got touched"));
     }
   } while (millis() - start < SLEEP_DELAY);
 
   Serial.println(F("Going to sleep..."));
 
+  digitalWrite(RED_PIN, 1);
+  digitalWrite(YELLOW_PIN, 0);
+  digitalWrite(GREEN_PIN, 0);
+  rfid1.PCD_SoftPowerDown();
+  disconnect_wifi();
   SPI.end();
   esp_sleep_enable_touchpad_wakeup();
   esp_deep_sleep_start();
@@ -225,14 +251,19 @@ bool is_connected()
   return connected;
   #endif
   #ifdef WIFI_MODE
+  digitalWrite(YELLOW_PIN, LOW);
   if(WiFi.status() != WL_CONNECTED) return false;
-  if(strcmp(WiFi.localIP().toString().c_str(), "0.0.0.0") != 0) return true;
+  // if(strcmp(WiFi.localIP().toString().c_str(), "0.0.0.0") != 0) {
+    digitalWrite(YELLOW_PIN, HIGH);
+    return true;
+  // }
   #endif
   return false;
 }
 void connect_wifi()
 {
   if(is_connected()) return;
+  digitalWrite(YELLOW_PIN, HIGH);
   #ifdef BLE
   Serial.println("Scanning Bluetooth...");
   BLEDevice::init("");
@@ -261,6 +292,11 @@ void connect_wifi()
     Serial.print(".");
     delay(250);
     if(millis() - start > 5000) break;
+    digitalWrite(RED_PIN, 1);
+    Serial.print(".");
+    delay(250);
+    if(millis() - start > 5000) break;
+    digitalWrite(RED_PIN, 0);
   }
   if(is_connected()) host = raspap_host;
   #endif
@@ -359,44 +395,66 @@ void send_checkin()
   Serial.println(checkinTag);
   client.end();
   #endif
-  disconnect_wifi();
 }
-void send_data(String data, const char* endpoint)
+void send_data(String data, const char* endpoint, const char* params)
 {
   connect_wifi();
   #ifdef WIFI_MODE
   HTTPClient client;
-  client.begin(get_endpoint(endpoint));
+  String url = get_endpoint(endpoint);
+  if(sizeof(params)>2)
+  {
+    url.concat(params);
+  }
+  client.begin(url);
   client.PUT(data);
   client.end();
   #endif
-  disconnect_wifi();
 }
 
-static bool check_rfid_pos(MFRC522 rfid) {
-  if(!rfid.PICC_ReadCardSerial()) return false;
-  Serial.print(F("Card UID:"));
-  
-  String uid = "";
+String get_uid(MFRC522 rfid) {
+  if(!rfid.uid.size) return lastUID;
+  lastUID = "";
   for(int i=0;i<rfid.uid.size;i++)
   {
-    uid.concat(rfid.uid.uidByte[i]);
-    Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
-    Serial.print(rfid.uid.uidByte[i], HEX);
+    //uid.concat(rfid.uid.uidByte[i]);
+    if(i>0)
+      lastUID.concat("-");
+    lastUID.concat(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+    lastUID.concat(String(rfid.uid.uidByte[i], HEX));
   }
-  Serial.println();
+  return lastUID;
+}
+bool check_rfid_pos(MFRC522 rfid) {
+  if(!rfid.PICC_IsNewCardPresent()) return false;
+  if(!rfid.PICC_ReadCardSerial()) return false;
+  Serial.print(F("Card UID: "));
   
-  send_data(uid, arfid);
+  get_uid(rfid);
   
+  Serial.println(lastUID);
+  
+  #ifdef IRQ_PIN
   clearInt(rfid);
+  #endif
   rfid.PICC_HaltA();
+  // lastRead = millis();
+  // rfid.
   bNewInt = false;
   return true;
 }
 
 bool check_rfid() {
-  if(!bNewInt) return false;
-  check_rfid_pos(rfid1);
+  // if(!bNewInt) return false;
+  if(bNewInt) digitalWrite(GREEN_PIN, HIGH);
+  bool present = check_rfid_pos(rfid1);
+  if(bLastRead1 != present)
+  {
+    bLastRead1 = present;
+    if(present)
+      send_data(lastUID, arfid, present?"":"?checkout=1");
+    digitalWrite(GREEN_PIN, bLastRead1);
+  }
   #ifdef SPI_SS2_PIN
   check_rfid_pos(rfid2);
   #endif
@@ -412,8 +470,9 @@ void readCard() {
 
 void setup_rfid(MFRC522 rfid)
 {
-  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, SPI_SS1_PIN);
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
   rfid.PCD_Init();		// Init MFRC522
+  // rfid.PCD_SetAntennaGain(rfid.RxGain_max);
   // rfid.PCD_DumpVersionToSerial();	// Show details of PCD - MFRC522 Card Reader details
   #ifdef IRQ_PIN
     pinMode(IRQ_PIN, INPUT_PULLUP);
